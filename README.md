@@ -1,4 +1,5 @@
 # 🔥 Firewall v1.0.0
+#### Author: Bocaletto Luca
 
 Un **firewall user-space all-in-one** in C, senza dipendenze esterne, token o registrazioni, pronto per la produzione.
 
