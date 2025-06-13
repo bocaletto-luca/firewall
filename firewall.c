@@ -1,86 +1,152 @@
 // firewall.c
-// ––––––––––––––––––––––––––––––––––––––––––––––––––––––––
-// Un “all-in-one” che:  
-//   • con -u fa apt update & upgrade  
-//   • con -d dry-run stampa i comandi  
-//   • altrimenti carica config.conf ed esegue i comandi nft
+// Un firewall user-space “all in one” con update/upgrade, log su syslog e dry-run.
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <syslog.h>
+#include <errno.h>
 
-#define MAX_LINE 512
+#define MAX_LINE   512
+#define DEFAULT_CFG "config.conf"
 
-void usage(const char *prog) {
-    fprintf(stderr,
-        "Usage: %s [-c config_file] [-d] [-u]\n"
-        "  -c FILE   Path to config file (default: config.conf)\n"
-        "  -d        Dry run (stampa i comandi senza eseguirli)\n"
-        "  -u        Esegui apt-get update && apt-get upgrade -y\n",
-        prog);
-    exit(1);
+// Prototipi
+static void usage(const char *prog);
+static int  run_cmd(const char *cmd, int dry_run);
+static char *trim(char *s);
+
+int main(int argc, char *argv[]) {
+    char *cfg_path = DEFAULT_CFG;
+    char *log_path = NULL;
+    int   dry_run  = 0;
+    int   do_update= 0;
+    int   opt;
+
+    // Apri syslog
+    openlog("firewall", LOG_PID|LOG_CONS, LOG_USER);
+    setlogmask(LOG_UPTO(LOG_INFO));
+
+    while ((opt = getopt(argc, argv, "c:dul:h")) != -1) {
+        switch (opt) {
+        case 'c': cfg_path  = optarg;           break;
+        case 'd': dry_run   = 1;                break;
+        case 'u': do_update = 1;                break;
+        case 'l': log_path  = optarg;           break;
+        case 'h':
+        default:
+            usage(argv[0]);
+        }
+    }
+
+    // Se l'utente specifica un log file, aprilo
+    FILE *lf = NULL;
+    if (log_path) {
+        lf = fopen(log_path, dry_run ? "w" : "a");
+        if (!lf) {
+            syslog(LOG_ERR, "Impossibile aprire logfile '%s': %s", 
+                   log_path, strerror(errno));
+            // non esco, continuo solo con syslog
+        }
+    }
+
+    // Verifica permessi di root per apt/nft
+    if (geteuid() != 0) {
+        syslog(LOG_ERR, "Devi eseguire come root");
+        fprintf(stderr, "Errore: esegui come root\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // 1) update & upgrade se richiesto
+    if (do_update) {
+        syslog(LOG_INFO, "Avvio apt-get update && upgrade");
+        if (run_cmd("apt-get update -y", dry_run) != 0 ||
+            run_cmd("apt-get upgrade -y", dry_run) != 0) {
+            syslog(LOG_ERR, "apt-get update/upgrade fallito");
+            if (lf) fprintf(lf, "apt-get update/upgrade fallito\n");
+            // ma proseguiamo comunque
+        } else {
+            syslog(LOG_INFO, "apt-get update/upgrade completato");
+            if (lf) fprintf(lf, "apt-get update/upgrade completato\n");
+        }
+    }
+
+    // 2) apertura config
+    FILE *cf = fopen(cfg_path, "r");
+    if (!cf) {
+        syslog(LOG_ERR, "Impossibile aprire config '%s': %s", 
+               cfg_path, strerror(errno));
+        fprintf(stderr, "Errore: non posso aprire %s\n", cfg_path);
+        exit(EXIT_FAILURE);
+    }
+    syslog(LOG_INFO, "Caricata config: %s", cfg_path);
+    if (lf) fprintf(lf, "Caricata config: %s\n", cfg_path);
+
+    // 3) esecuzione righe nft
+    char line[MAX_LINE];
+    int  rc=0, lineno=0;
+    while (fgets(line, sizeof(line), cf)) {
+        lineno++;
+        char *cmd = trim(line);
+        if (cmd[0]=='\0' || cmd[0]=='#') continue;
+
+        char full[MAX_LINE + 16];
+        snprintf(full, sizeof(full), "nft %s", cmd);
+
+        syslog(LOG_INFO, "[Line %d] %s", lineno, full);
+        if (lf) fprintf(lf, "[Line %d] %s\n", lineno, full);
+
+        if (run_cmd(full, dry_run) != 0) {
+            syslog(LOG_ERR, "Riga %d Fallita: %s", lineno, full);
+            if (lf) fprintf(lf, "Riga %d Fallita\n", lineno);
+            rc = EXIT_FAILURE;
+        }
+    }
+    fclose(cf);
+    if (lf) fclose(lf);
+
+    syslog(LOG_INFO, "Firewall apply %s", (rc==0?"completato":"con errori"));
+    closelog();
+    return rc;
 }
 
-// Esegue (o stampa, in dry-run) un comando di shell
-int exec_cmd(const char *cmd, int dry_run) {
+// Mostra help e esci
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "  -c FILE   Path to config file (default: %s)\n"
+        "  -d        Dry run (stampa i comandi senza eseguirli)\n"
+        "  -u        Esegui apt-get update && apt-get upgrade -y\n"
+        "  -l FILE   Log su file oltre a syslog\n"
+        "  -h        Questo help\n",
+        prog, DEFAULT_CFG);
+    exit(EXIT_FAILURE);
+}
+
+// Esegue o stampa un comando shell
+static int run_cmd(const char *cmd, int dry_run) {
     if (dry_run) {
         printf("[DRY] %s\n", cmd);
         return 0;
-    } else {
-        printf("[RUN] %s\n", cmd);
-        return system(cmd);
     }
+    int ret = system(cmd);
+    if (ret != 0) {
+        syslog(LOG_ERR, "Comando fallito (%d): %s", ret, cmd);
+    }
+    return ret;
 }
 
-int main(int argc, char *argv[]) {
-    char *cfg_path = "config.conf";
-    int dry_run = 0, do_update = 0;
-    int opt;
-
-    while ((opt = getopt(argc, argv, "c:duh")) != -1) {
-        switch (opt) {
-        case 'c': cfg_path = optarg;        break;
-        case 'd': dry_run = 1;              break;
-        case 'u': do_update = 1;            break;
-        case 'h':
-        default:  usage(argv[0]);
-        }
-    }
-
-    // 1) Se richiesto, apt-get update & upgrade -y
-    if (do_update) {
-        exec_cmd("sudo apt-get update", dry_run);
-        exec_cmd("sudo apt-get upgrade -y", dry_run);
-        // Se volevi fermarti qui, decommenta exit:
-        // return 0;
-    }
-
-    // 2) Leggi config e applica regole nft
-    FILE *fp = fopen(cfg_path, "r");
-    if (!fp) {
-        perror("fopen");
-        return 1;
-    }
-
-    char line[MAX_LINE];
-    while (fgets(line, sizeof(line), fp)) {
-        char *p = line;
-        while (isspace((unsigned char)*p)) p++;
-        if (*p == '#' || *p == '\0' || *p == '\n')
-            continue;
-        char *nl = strchr(p, '\n');
-        if (nl) *nl = '\0';
-
-        char cmd[MAX_LINE + 8];
-        snprintf(cmd, sizeof(cmd), "sudo nft %s", p);
-        if (exec_cmd(cmd, dry_run) != 0) {
-            fprintf(stderr, "Errore comando: %s\n", cmd);
-        }
-    }
-    fclose(fp);
-
-    printf("Firewall apply completed.\n");
-    return 0;
+// Rimuove spazi iniziali/finali
+static char *trim(char *s) {
+    char *end;
+    // left trim
+    while (isspace((unsigned char)*s)) s++;
+    if (*s == 0) return s;
+    // right trim
+    end = s + strlen(s) - 1;
+    while (end > s && isspace((unsigned char)*end)) end--;
+    end[1] = '\0';
+    return s;
 }
